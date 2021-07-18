@@ -14,9 +14,89 @@ import tensorflow as tf
 import pickle
 import warnings
 import logging
+import h5py
+from rdkit import Chem
+from os import path
 logger = logging.getLogger("MSNovelist")
 
-#from tensorflow import io
+def parseFormulaFromSmiles(smiles):
+    m=Chem.MolToSmiles(smiles)
+    m_ = Chem.AddHs(m)
+    c = Counter(atom.GetSymbol() for atom in m_.GetAtoms())
+    return np.array([c[elem] for elem in sp.ELEMENTS_RDKIT])
+
+# woah, this tensorflow api is sooo horrible and its documentation soo shitty.
+# I gave up to implement this as proper generator. Something so simple shouldn't be so complicated :(
+def datasetFromHdf5(msnoveldir,sampling=0, length = sp.SEQUENCE_LEN,
+                    initial = sp.INITIAL_CHAR,
+                    final = sp.FINAL_CHAR,
+                    pad = sp.TF_PAD_CHAR,
+                    hinting = False,
+                    return_smiles = False,
+                    unpack = True,
+                    unpickle_mf = True,
+                    embed_X = True,):
+    biodb = h5py.File(path.join(msnoveldir, "msnovelist_data.h5"),"r")
+    fingerprints = tf.convert_to_tensor(biodb["fingerprint"][:,:],dtype=tf.uint8)
+    smiles = biodb["smiles"][:]
+    inchikey = biodb["inchikey"][:]
+    inchikey1 = biodb["inchikey1"][:]
+    mf_text = biodb["mf_text"][:]
+    grp = biodb["grp"][:]
+    N = smiles.shape[0]
+    useIndizes = 
+    forms = np.array([parseFormulaFromSmiles(smiles) for smiles in smiles])
+    hydrogens = tf.convert_to_tensor(forms[:,-sp.index("H")])
+    forms = tf.convert_to_tensor(forms)
+    # On the SMILES side: map elements, pad, and split to X,y
+    dataset_batch_X_generic, dataset_batch_y_generic = xy_pipeline(
+        smiles,length, initial, final, pad, forms,hinting
+        )
+    # why do we have canonical and generic?
+    dataset_batch_X_canonical, dataset_batch_y_canonical = dataset_batch_X_generic, dataset_batch_y_generic
+    # SELFIES processing
+    dataset_tokens_X, dataset_tokens_y = xy_tokens_pipeline(
+        dataset_batch_smiles_canonical, embed_X = embed_X)
+    indizes = np.arange(0, N)
+    if sampling == 0:
+        deg = tf.convert_to_tensor(biodb["fingerprints_degraded"][:,:], dtype=tf.float32)
+        order = np.shuffle(indizes)
+        return tf.data.Dataset.from_tensor_slices({'fingerprint': fingerprints[order], 
+                'fingerprint_degraded': deg[order], 
+                'smiles_X_generic': dataset_batch_X_generic[order], 
+                'smiles_y_generic': dataset_batch_y_generic[order], 
+                'smiles_X_canonical': dataset_batch_X_canonical[order], 
+                'smiles_y_canonical': dataset_batch_y_canonical[order], 
+                'mol_form': forms[order],
+                'smiles_generic': smiles[order],
+                'smiles_canonical': smiles[order],
+                'n_hydrogen': hydrogens[order],
+                'tokens_X': dataset_tokens_X[order],
+                'tokens_y': dataset_tokens_y[order]
+                })
+    # now generate for each fold a new dataset
+    biodb.close()
+    filename = path.join(msnoveldir, "msnovelist_sample_%d.h5" % sampling)
+    order = np.random.shuffle(indizes)
+    sample = h5py.File(filename, "r")
+    deg = tf.convert_to_tensor(sample["fingerprints_degraded"][:,:], dtype=tf.float32)
+    sample.close
+    index += 1 
+    dataset = {'fingerprint': fingerprints[order], 
+            'fingerprint_degraded': deg[order], 
+            'smiles_X_generic': dataset_batch_X_generic[order], 
+            'smiles_y_generic': dataset_batch_y_generic[order], 
+            'smiles_X_canonical': dataset_batch_X_canonical[order], 
+            'smiles_y_canonical': dataset_batch_y_canonical[order], 
+            'mol_form': forms[order],
+            'smiles_generic': smiles[order],
+            'smiles_canonical': smiles[order],
+            'n_hydrogen': hydrogens[order],
+            'tokens_X': dataset_tokens_X[order],
+            'tokens_y': dataset_tokens_y[order]
+            }
+    return tf.data.Dataset.from_tensor_slices(dataset)
+
 
 
 def fp_pipeline(fpd, fp_map = None, unpack = True):
