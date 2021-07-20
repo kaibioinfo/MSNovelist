@@ -19,85 +19,112 @@ from rdkit import Chem
 from os import path
 logger = logging.getLogger("MSNovelist")
 
+
+################################################
+# my own code additions to read from HDF5
+################################################
+
+from collections import Counter
+
+# transform SMILES to molecular formula vector
 def parseFormulaFromSmiles(smiles):
-    m=Chem.MolToSmiles(smiles)
+    m=Chem.MolFromSmiles(smiles)
+    if not m:
+        return None
     m_ = Chem.AddHs(m)
     c = Counter(atom.GetSymbol() for atom in m_.GetAtoms())
     return np.array([c[elem] for elem in sp.ELEMENTS_RDKIT])
 
-# woah, this tensorflow api is sooo horrible and its documentation soo shitty.
+# I still got so many problems with the dataset API, I will just process
+# everything in memory. 
+def prepareSmilesTensor(smiles_tensor,
+                length = sp.SEQUENCE_LEN,
+                initial = sp.INITIAL_CHAR,
+                final = sp.FINAL_CHAR,
+                pad = sp.TF_PAD_CHAR,
+                mol_form = None,
+                hinting = False):
+    x,y=sp.smiles_xysplit(sp.smiles_pad(sp.smiles_map_elements(smiles_tensor),length, initial, final, pad, "back"))
+    x = sp.smiles_encode_x(x)
+    y = sp.smiles_encode_y(y)
+    return (tf.cast(x,tf.float32), tf.cast(y,tf.float32))
+def prepareTokenTensor(smiles_tensor,
+                length = tkp.SEQUENCE_LEN,
+                initial = tkp.INITIAL_CHAR,
+                final = tkp.FINAL_CHAR,
+                pad = tkp.PAD_CHAR,
+                embed_X = True):
+    logger.info(f'embed_X = {embed_X}')
+    x,y=tkp.tokens_split_xy(tkp.tokens_onehot(tkp.tokens_to_tf(smiles_tensor)))
+    if embed_X:
+        x= tkp.tokens_embed_all(x)
+    return (x,y)
+
+
+# woah, this tensorflow api is sooo horrible.
 # I gave up to implement this as proper generator. Something so simple shouldn't be so complicated :(
-def datasetFromHdf5(msnoveldir,sampling=0, length = sp.SEQUENCE_LEN,
+def datasetFromHdf5(metafile, fpfile=None, length = sp.SEQUENCE_LEN,
                     initial = sp.INITIAL_CHAR,
                     final = sp.FINAL_CHAR,
                     pad = sp.TF_PAD_CHAR,
                     hinting = False,
-                    return_smiles = False,
-                    unpack = True,
-                    unpickle_mf = True,
                     embed_X = True,):
-    biodb = h5py.File(path.join(msnoveldir, "msnovelist_data.h5"),"r")
-    fingerprints = tf.convert_to_tensor(biodb["fingerprint"][:,:],dtype=tf.uint8)
+    biodb = h5py.File(metafile,"r")
+    fingerprints = biodb["fingerprints"][:,:]
     smiles = biodb["smiles"][:]
-    inchikey = biodb["inchikey"][:]
-    inchikey1 = biodb["inchikey1"][:]
-    mf_text = biodb["mf_text"][:]
     grp = biodb["grp"][:]
     N = smiles.shape[0]
-    useIndizes = 
-    forms = np.array([parseFormulaFromSmiles(smiles) for smiles in smiles])
-    hydrogens = tf.convert_to_tensor(forms[:,-sp.index("H")])
-    forms = tf.convert_to_tensor(forms)
-    # On the SMILES side: map elements, pad, and split to X,y
-    dataset_batch_X_generic, dataset_batch_y_generic = xy_pipeline(
+    # some SMILES in the table are invalid
+    # I still parse them and remove them afterwards
+    # by leaving out the elements from the indizes/order vector
+    dummy = np.zeros(len(sp.ELEMENTS_RDKIT))
+    forms = []
+    indizes = []
+    for (index, smi) in enumerate(smiles):
+        x=parseFormulaFromSmiles(smi)
+        if x is not None:
+            forms.append(x)
+            indizes.append(index)
+        else:
+            forms.append(dummy)
+    order = np.array(indizes)
+    np.random.shuffle(indizes)
+    forms = np.array(forms)
+    hydrogens = forms[:,sp.ELEMENTS_RDKIT.index("H")]
+    if fpfile==None:
+        deg = biodb["fingerprints_degraded"][:,:]
+    else:
+        sample = h5py.File(fpfile, "r")
+        deg = sample["fingerprints_degraded"][:,:]
+        sample.close()
+    biodb.close()
+    fingerprints = tf.convert_to_tensor(fingerprints[order], dtype=tf.uint8)
+    fingerprint_degraded = tf.convert_to_tensor(deg[order], dtype=tf.float32)
+    smiles = tf.convert_to_tensor(smiles[order], dtype=tf.string)
+    mol_forms = tf.convert_to_tensor(forms[order], dtype=tf.float32)
+    hydrogens = tf.convert_to_tensor(hydrogens[order], dtype=tf.float32)
+    dataset_batch_X_generic, dataset_batch_y_generic = prepareSmilesTensor(
         smiles,length, initial, final, pad, forms,hinting
         )
     # why do we have canonical and generic?
     dataset_batch_X_canonical, dataset_batch_y_canonical = dataset_batch_X_generic, dataset_batch_y_generic
-    # SELFIES processing
-    dataset_tokens_X, dataset_tokens_y = xy_tokens_pipeline(
-        dataset_batch_smiles_canonical, embed_X = embed_X)
-    indizes = np.arange(0, N)
-    if sampling == 0:
-        deg = tf.convert_to_tensor(biodb["fingerprints_degraded"][:,:], dtype=tf.float32)
-        order = np.shuffle(indizes)
-        return tf.data.Dataset.from_tensor_slices({'fingerprint': fingerprints[order], 
-                'fingerprint_degraded': deg[order], 
-                'smiles_X_generic': dataset_batch_X_generic[order], 
-                'smiles_y_generic': dataset_batch_y_generic[order], 
-                'smiles_X_canonical': dataset_batch_X_canonical[order], 
-                'smiles_y_canonical': dataset_batch_y_canonical[order], 
-                'mol_form': forms[order],
-                'smiles_generic': smiles[order],
-                'smiles_canonical': smiles[order],
-                'n_hydrogen': hydrogens[order],
-                'tokens_X': dataset_tokens_X[order],
-                'tokens_y': dataset_tokens_y[order]
+    dataset_tokens_X, dataset_tokens_y = prepareTokenTensor(smiles, embed_X = embed_X)
+    return tf.data.Dataset.from_tensor_slices({'fingerprint': fingerprints, 
+                "fingerprint_selected": fingerprint_degraded,
+                'fingerprint_degraded': fingerprint_degraded, 
+                'smiles_X_generic': dataset_batch_X_generic, 
+                'smiles_y_generic': dataset_batch_y_generic, 
+                'smiles_X_canonical': dataset_batch_X_canonical, 
+                'smiles_y_canonical': dataset_batch_y_canonical, 
+                'mol_form': mol_forms,
+                'smiles_generic': smiles,
+                'smiles_canonical': smiles,
+                'n_hydrogen': hydrogens,
+                'tokens_X': dataset_tokens_X,
+                'tokens_y': dataset_tokens_y
                 })
-    # now generate for each fold a new dataset
-    biodb.close()
-    filename = path.join(msnoveldir, "msnovelist_sample_%d.h5" % sampling)
-    order = np.random.shuffle(indizes)
-    sample = h5py.File(filename, "r")
-    deg = tf.convert_to_tensor(sample["fingerprints_degraded"][:,:], dtype=tf.float32)
-    sample.close
-    index += 1 
-    dataset = {'fingerprint': fingerprints[order], 
-            'fingerprint_degraded': deg[order], 
-            'smiles_X_generic': dataset_batch_X_generic[order], 
-            'smiles_y_generic': dataset_batch_y_generic[order], 
-            'smiles_X_canonical': dataset_batch_X_canonical[order], 
-            'smiles_y_canonical': dataset_batch_y_canonical[order], 
-            'mol_form': forms[order],
-            'smiles_generic': smiles[order],
-            'smiles_canonical': smiles[order],
-            'n_hydrogen': hydrogens[order],
-            'tokens_X': dataset_tokens_X[order],
-            'tokens_y': dataset_tokens_y[order]
-            }
-    return tf.data.Dataset.from_tensor_slices(dataset)
 
-
+############################################################################
 
 def fp_pipeline(fpd, fp_map = None, unpack = True):
     if unpack:
@@ -139,6 +166,28 @@ def mf_pipeline(mf):
         [[co[el] for el in sp.ELEMENTS_RDKIT] for co in mf])
     return data
        
+
+def xy_tokens_pipeline(dataset_batch_smiles,
+                length = tkp.SEQUENCE_LEN,
+                initial = tkp.INITIAL_CHAR,
+                final = tkp.FINAL_CHAR,
+                pad = tkp.PAD_CHAR,
+                embed_X = True):
+    dataset_batch_Xy = dataset_batch_smiles.map(
+        lambda s: tkp.tokens_to_tf(s))
+    dataset_batch_Xy = dataset_batch_Xy.map(
+        lambda s: tkp.tokens_onehot(s))
+    dataset_batch_Xy = dataset_batch_Xy.map(
+        lambda s: tkp.tokens_split_xy(s))
+    dataset_batch_X = dataset_batch_Xy.map(lambda X, y: X)
+    dataset_batch_y = dataset_batch_Xy.map(lambda X, y: y)
+    
+    if embed_X:
+        dataset_batch_X = dataset_batch_X.map(
+            lambda s: tkp.tokens_embed_all(s))
+    return dataset_batch_X, dataset_batch_y
+            
+
     
 def xy_pipeline(dataset_batch_smiles,
                 length = sp.SEQUENCE_LEN,
@@ -231,7 +280,7 @@ def smiles_pipeline(dataset,
     # # On the fingerprint side: Transform the fingerprints offline, because
     # # it is small and fast enough, and we don't need to convert all functions
     # # to TF.
-    # fpr = fp_pipeline(fpr, fp_map, unpack = unpack)
+    # fpr = fp_pipeline(fpr, fp_map, unpack = unpack)epochs
     # try:
     #     fprd = fp_pipeline(fprd, fp_map, unpack = unpack)
     # except IndexError:
