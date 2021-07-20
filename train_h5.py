@@ -7,12 +7,7 @@ Created on Tue Aug 14 15:58:01 2018
 
 
 from tqdm import tqdm
-
-from fp_management import database as db
-from fp_management import fingerprinting as fpr
-from fp_management import fingerprint_map as fpm
 from rdkit import Chem
-
 import smiles_process as sp
 import importlib
 from importlib import reload
@@ -88,28 +83,26 @@ os.makedirs(log_path)
 
 sc.config_dump(config_dump_path)
 
-
-
+from os import path
+sc.config["db_path"] = "/msnovelist-data/"
 # Load mapping table for the CSI:FingerID predictors
 
 logger.info(f"Datasets - loading database")
-fp_train = gen.hdf5Generator(path.join(sc.config["db_path"], "msnovelist_data.h5"), sampling=1)
-fp_val = gen.hdf5Generator(path.join(sc.config["db_path"], "train.h5"))
-fp_indep = gen.hdf5Generator(path.join(sc.config["db_path"], "eval.h5"))
+fp_train = gen.datasetFromHdf5(path.join(sc.config["db_path"], "msnovelist_data.h5"),path.join(sc.config["db_path"], "msnovelist_sample_1.h5"),embed_X=False)
+fp_val = gen.datasetFromHdf5(path.join(sc.config["db_path"], "train.h5"),embed_X=False)
+fp_indep = gen.datasetFromHdf5(path.join(sc.config["db_path"], "test.h5"),embed_X=False)
 logger.info(f"Datasets - pipelines built")
 
-fp_dataset_train = fp_train.batch(sc.config['batch_size']).prefetch(tf.data.experimental.AUTOTUNE)
+fp_dataset_train = fp_train.batch(sc.config['batch_size'])
 
-blueprints = gen.dataset_blueprint(fp_dataset_train)
-
-fp_dataset_val = gen.dataset_zip(fp_val, pipeline_x, pipeline_y,
-                                 **fp_db.get_pipeline_options())
-fp_dataset_val = fp_dataset_val.prefetch(tf.data.experimental.AUTOTUNE)
-
-fp_dataset_eval = gen.dataset_zip(fp_indep, pipeline_x, pipeline_y,
-                                  **db_eval.get_pipeline_options())
-fp_dataset_eval = fp_dataset_eval.prefetch(tf.data.experimental.AUTOTUNE)
-
+#blueprints = gen.dataset_blueprint(fp_dataset_train)
+# I still don't get what a blueprint is. I assume it is just a single batch
+# from your training data you use to initialize the model?
+blueprints = None
+for blueprints in fp_dataset_train:
+    break
+fp_dataset_val = fp_val
+fp_dataset_eval = fp_indep
 training_total = len(fp_train)
 validation_total= len(fp_val)
 training_steps = math.floor(training_total /  sc.config['batch_size'])
@@ -125,16 +118,11 @@ epochs=sc.config['epochs']
 
 logger.info(f"Preparing training: {epochs} epochs, {training_steps} steps per epoch, batch size {batch_size}")
 
-
-round_fingerprints = False
-if sampler_name != '':
-    round_fingerprints = sf.round_fingerprint_inference()
-
 import model
 transcoder_model = model.TranscoderModel(
     blueprints = blueprints,
     config = sc.config,
-    round_fingerprints = round_fingerprints
+    round_fingerprints = False # I currently do not round, but that should be easy to add if necessary
     )
 
 initial_epoch = 0
@@ -202,8 +190,15 @@ callbacks_list = [evaluation,
                   save_optimizer]
 
 logger.info("Training - start")
+# I would like to train on different sampled datasets
+# each time instead of 15 times on the same dataset.
+# I guess the right way to do this would be to
+# write a Dataset.from_generator that reads all
+# hdf5 files and process them. But this API makes me crazy.
+# For now I would just #datasetFromHdf5 separately for
+# each sample file and run fit with epoch=1.
 transcoder_model.fit(x=fp_dataset_train, 
-          epochs=epochs, 
+          epochs=1, 
           #batch_size=sc.config['batch_size'],
           steps_per_epoch=training_steps,
           callbacks = callbacks_list,
@@ -211,8 +206,9 @@ transcoder_model.fit(x=fp_dataset_train,
           validation_steps = validation_steps,
           initial_epoch = initial_epoch,
           verbose = verbose)
-logger.info("Training - done")
-fp_db.close()
 
+
+
+logger.info("Training - done")
 logger.info("training end")
 
